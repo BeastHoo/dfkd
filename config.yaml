@@ -1,0 +1,160 @@
+# ============================================================
+# 无数据联邦知识蒸馏系统（Data-Free FedKD）- 最优超参数配置
+# 基于以下依据调参：
+#   - FedDF / DENSE / Data-Free KD 相关论文经验值
+#   - DCGAN 原论文最佳实践
+#   - Sinkhorn 最优传输数值稳定性要求
+#   - 非IID联邦学习收敛性研究结论
+# ============================================================
+
+# ---------- 路径配置 ----------
+dataset: cifar10
+data_dir: ./data/raw
+partition_dir: ./data/partitions
+teacher_ckpt_dir: ./teacher_ckpts
+ckpt_dir: ./checkpoints
+
+# ---------- 数据划分 ----------
+# α=0.1：强非IID，充分测试系统在极端异构场景下的知识融合能力
+# 若追求稳定收敛可调至 0.3~0.5；论文对比实验通常取 0.1/0.5 两档
+num_clients: 10
+dirichlet_alpha: 0.1
+seed: 42
+
+# ---------- 聚类配置 ----------
+# num_clusters=3：K=10 客户端分3簇，簇内平均3~4个客户端
+#   - 簇太少（M=1）退化为无聚类的全局聚合，丧失分层优势
+#   - 簇太多（M≈K）每簇只有1个客户端，簇内聚合无意义
+#   - M = ceil(sqrt(K)) ≈ 3 是经验上的均衡点
+# sinkhorn_eps=0.01：更小的正则化系数使 Sinkhorn 距离更接近真实 EMD
+#   - eps 越小越精确但数值稳定性越差；0.01 在 log 域实现下是安全下限
+#   - 非IID场景分布差异显著，小 eps 能更清晰地区分客户端
+# sinkhorn_iters=100：log 域实现收敛快，50 次已足够；100 次确保充分收敛
+num_clusters: 3
+sinkhorn_eps: 0.01
+sinkhorn_iters: 100
+
+# ---------- 模型配置 ----------
+# latent_dim=256：比默认 100 更大的潜在空间
+#   - 生成器表达能力更强，生成样本多样性更高
+#   - CIFAR-10（10类）的语义空间不复杂，256 维足够覆盖
+latent_dim: 256
+num_classes: 10
+image_channels: 3
+image_size: 32
+
+# ---------- 联邦训练 ----------
+# fed_rounds=200：联邦蒸馏通常需要较多轮次收敛
+#   - 无数据场景生成质量从低到高需要时间，前50轮通常accuracy较低
+#   - 200轮是 DENSE/FedDF 等工作的标准设置
+# gen_batch_size=256：生成器 batch 足够大，覆盖多种语义模式
+#   - 太小（<64）导致每轮聚合信号噪声大；太大（>512）显存压力高
+# local_gan_steps=5：判别器更新步数
+#   - 经典 GAN 训练建议 D 更新步数 ≥ G，防止 G 过快"欺骗"弱判别器
+#   - 5步是 DCGAN/StyleGAN 训练中常用的稳定设置
+# generator_steps=1：G 每轮只更新1步
+#   - 避免 G 过度优化导致模式崩溃（mode collapse）
+#   - G 更新慢、D 更新快是 GAN 稳定训练的关键原则
+# central_steps=10：S 每轮更新步数较多
+#   - S 的蒸馏损失比 GAN 损失更稳定，可以多步更新加速收敛
+#   - 蒸馏任务（监督信号明确）比对抗任务更容易优化
+# temperature=4.0：知识蒸馏温度
+#   - Hinton 原论文推荐 τ=4~8；τ 越高软标签越平滑，类间关系越丰富
+#   - 非IID场景客户端预测方差大，较高温度有助于平滑聚合结果
+fed_rounds: 200
+gen_batch_size: 256
+local_gan_steps: 5
+generator_steps: 1
+central_steps: 10
+temperature: 4.0
+
+# ---------- 分层聚合超参数 ----------
+# agg_temperature=0.5：簇间聚合温度 T_agg
+#   - T_agg < 1：锐化质量差异，高质量簇权重显著放大
+#   - T_agg = 1：线性质量加权（中性）
+#   - T_agg → ∞：退化为纯规模加权，忽略质量差异
+#   - 非IID场景各簇质量差异显著，T_agg=0.5 能有效突出高质量簇
+# gamma=0.5：簇规模指数
+#   - gamma=1.0：线性规模加权，大簇主导
+#   - gamma=0.5：平方根缩放，削弱大簇的统治性，给小簇更多话语权
+#   - 非IID场景小簇可能持有稀有类别知识，gamma=0.5 保护少数知识
+agg_temperature: 0.5
+gamma: 0.5
+
+# ---------- 损失权重 ----------
+# lambda1=1.0（L_conf）：最小化预测熵，语义清晰性，核心损失保持权重1
+# lambda2=0.5（L_div）：最大化多样性，适度约束
+#   - 太大会导致 G 只追求多样性而生成无意义的高熵噪声
+#   - 0.5 在清晰性与多样性之间取得平衡
+# lambda3=1.0（L_adv）：对抗损失，与 L_conf 等权
+#   - 对抗损失保证生成样本的视觉真实性，不可过小
+# lambda_balance：batch 边际分布熵正则化，防止模式崩溃
+#   - 对应 FedIOD w_baln=10，但我们已对齐为正值熵后取负，量级不同
+#   - compute_loss_balance 返回正值（log2 熵，范围 0~3.32），总损失中取负
+#   - 建议从 1.0 开始，若 fake data 仍退化为单类则增大至 2.0~5.0
+lambda1: 1.0
+lambda2: 0.5
+lambda3: 1.0
+lambda_balance: 1.0
+
+# ---------- 优化器学习率 ----------
+# lr_g=0.0002：DCGAN 原论文标准值，GAN 训练中最稳定的 G 学习率
+# lr_d=0.0002：与 G 相同，避免 D 收敛过快导致梯度消失
+# lr_s=0.0005：S 的蒸馏训练比 GAN 稳定，稍高学习率加速收敛
+#   - 不宜过高（>0.001），生成样本质量不均时高 lr 导致 S 震荡
+# adam_beta1=0.5：DCGAN 推荐值，比默认 0.9 在对抗训练中更稳定
+#   - beta1=0.9 会保留过多历史梯度，GAN 训练中容易导致模式崩溃
+# adam_beta2=0.999：保持默认值，控制二阶矩估计的平滑程度
+lr_g: 0.0002
+lr_d: 0.0002
+lr_s: 0.0005
+adam_beta1: 0.5
+adam_beta2: 0.999
+
+# ---------- Checkpoint 与评估 ----------
+# eval_every=10：每10轮评估一次，不过于频繁（评估本身有开销）
+# save_ckpt_every=20：每20轮保存一次，平衡磁盘占用与恢复粒度
+eval_every: 10
+save_ckpt_every: 20
+
+# ---------- 设备配置 ----------
+device: cuda
+
+# ---------- 日志配置 ----------
+log_dir: ./logs
+
+# ============================================================
+# 以下为客户端预训练模块新增字段（pretrain_main.py 使用）
+# 追加于此处，不修改上方已有字段
+# ============================================================
+
+# ---------- 客户端预训练 ----------
+# pretrain_epochs=100：CIFAR-10 上 ResNet-18 标准收敛轮数
+#   - Small/Medium 结构轮数相同，容量小收敛更快，多余轮次无害
+# pretrain_batch_size=128：分类任务标准 batch，平衡显存与梯度质量
+# pretrain_lr=0.1：SGD + cosine 的标准初始学习率
+#   - 配合 CosineAnnealingLR 从 0.1 衰减到接近 0，全程无需手动调整
+# pretrain_momentum=0.9：SGD momentum 标准值
+# pretrain_weight_decay=5.0e-4：CIFAR ResNet 标准正则化强度
+# pretrain_lr_scheduler=cosine：CosineAnnealingLR 比 StepLR 更平滑
+#   - cosine：学习率从 pretrain_lr 余弦衰减至 0，无需设置 milestone
+#   - step：每 pretrain_lr_step 轮乘以 pretrain_lr_gamma
+pretrain_epochs: 100
+pretrain_batch_size: 128
+pretrain_lr: 0.1
+pretrain_momentum: 0.9
+pretrain_weight_decay: 5.0e-4
+pretrain_lr_scheduler: cosine  # cosine | step
+pretrain_lr_step: 50           # 仅 scheduler=step 时有效
+pretrain_lr_gamma: 0.1         # 仅 scheduler=step 时有效
+
+# pretrain_parallel=false：默认串行，避免多进程 GPU 竞争
+#   - 若机器有多块 GPU 或客户端数量多，可设为 true
+pretrain_parallel: false
+
+# model_type_assignment=random：随机分配体现客户端异构性
+#   - random：每个客户端随机分配 Small / Medium / Large
+#   - fixed：所有客户端使用同一结构（由 fixed_model_type 指定）
+# fixed_model_type：仅 model_type_assignment=fixed 时生效
+model_type_assignment: random
+fixed_model_type: Large
