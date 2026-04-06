@@ -150,7 +150,7 @@ class FedDistillServer:
               f"簇头={self.cluster_heads}")
 
     def _init_server_models(self):
-        """初始化生成器 G、中心模型 S 及其优化器。"""
+        """初始化生成器 G、中心模型 S 及其优化器和学习率调度器。"""
         print("[server] 初始化服务器端模型...")
 
         # 生成器 G
@@ -165,11 +165,14 @@ class FedDistillServer:
             image_channels=self.cfg.image_channels,
         ).to(self.device)
 
-        # 优化器
-        self.optimizer_g, self.optimizer_s = build_optimizers(
+        # 优化器 + CosineAnnealingLR 调度器（对齐 FedIOD）
+        (self.optimizer_g, self.optimizer_s, self.optimizer_d,
+         self.sched_g, self.sched_s, self.sched_d) = build_optimizers(
             generator=self.generator,
             central_model=self.central_model,
+            clients=self.clients,
             cfg=self.cfg,
+            total_steps=self.cfg.fed_rounds,
         )
 
         # 创建 checkpoint 目录
@@ -282,6 +285,30 @@ class FedDistillServer:
                 traceback.print_exc()
 
         return logits_dict, softmax_dict
+
+    def _parallel_local_compute_logits_only(
+        self, x_fake: torch.Tensor
+    ) -> Dict[int, torch.Tensor]:
+        """
+        仅执行 T_k 推理并返回 logits_dict，供 update_central_model 的
+        logits_dict_getter 参数使用（每步重新采样时调用）。
+
+        Args:
+            x_fake: 生成数据，shape=(B, C, H, W)
+
+        Returns:
+            logits_dict: {client_id: z_k}
+        """
+        logits_dict: Dict[int, torch.Tensor] = {}
+        for client in self.clients:
+            try:
+                z_k, _ = client.infer(x=x_fake, temperature=self.cfg.temperature)
+                logits_dict[client.client_id] = z_k.detach()
+            except Exception as e:
+                import traceback
+                print(f"[server] 警告：客户端 {client.client_id} 推理失败:")
+                traceback.print_exc()
+        return logits_dict
 
     # ================================================================== #
     #  阶段 3：分层聚合
@@ -469,7 +496,7 @@ class FedDistillServer:
             x_fake = self._generate_fake_data()
 
             # ---------------------------------------------------------- #
-            #  阶段 2-A：联合更新所有判别器（对齐 FedIOD update_netDS_batch）
+            #  阶段 2-A：联合更新所有判别器
             # ---------------------------------------------------------- #
             avg_d_loss = self._train_discriminators_jointly(
                 x_fake=x_fake,
@@ -491,7 +518,7 @@ class FedDistillServer:
                 agg_info = {}
 
             # ---------------------------------------------------------- #
-            #  阶段 4-A：更新生成器 G
+            #  阶段 4-A：更新生成器 G（对齐 FedIOD update_netG_batch）
             # ---------------------------------------------------------- #
             g_loss_info = update_generator(
                 generator=self.generator,
@@ -507,18 +534,28 @@ class FedDistillServer:
             )
 
             # ---------------------------------------------------------- #
-            #  阶段 4-B：更新中心模型 S
+            #  阶段 4-B：更新中心模型 S（对齐 FedIOD update_netS_batch）
+            #  每步重新采样新数据 + 同步推理 T_k + 分层聚合
             # ---------------------------------------------------------- #
-            # 注意：传入阶段1生成的同一批 x_fake，与 Z 严格对应
-            # 保证"S(x_fake) 对标 Z=Aggregate({T_k(x_fake)})"的标签-输入一致性
             loss_s = update_central_model(
+                generator=self.generator,
                 central_model=self.central_model,
                 optimizer_s=self.optimizer_s,
-                x_fake=x_fake,        # 阶段1生成、阶段2/3使用的同一批数据
-                Z=Z,
+                cluster_assignments=self.cluster_assignments,
+                logits_dict_getter=self._parallel_local_compute_logits_only,
+                pi_k_dict=self.pi_k_dict,
+                cluster_sizes=self.cluster_sizes,
                 cfg=self.cfg,
+                device=self.device,
                 num_steps=self.cfg.central_steps,
             )
+
+            # ---------------------------------------------------------- #
+            #  调度器更新（对齐 FedIOD sched.step()）
+            # ---------------------------------------------------------- #
+            self.sched_g.step()
+            self.sched_s.step()
+            self.sched_d.step()
 
             # ---------------------------------------------------------- #
             #  评估：每 eval_every 轮测试 S 的 top-1 accuracy
@@ -531,10 +568,10 @@ class FedDistillServer:
                     f"[server] Round {round_idx:4d}/{total_rounds} | "
                     f"Acc={accuracy:.4f} | "
                     f"L_G={g_loss_info['loss_g']:.4f} | "
-                    f"L_conf={g_loss_info['loss_conf']:.4f} | "
-                    f"L_bal={g_loss_info['loss_balance']:.4f} | "
-                    f"L_div={g_loss_info['loss_div']:.4f} | "
+                    f"L_gan={g_loss_info['loss_gan']:.4f} | "
                     f"L_adv={g_loss_info['loss_adv']:.4f} | "
+                    f"L_align={g_loss_info['loss_align']:.4f} | "
+                    f"L_bal={g_loss_info['loss_balance']:.4f} | "
                     f"L_S={loss_s:.4f} | "
                     f"L_D={avg_d_loss:.4f}"
                 )
@@ -552,7 +589,7 @@ class FedDistillServer:
             self.logger.log_round(
                 round_idx=round_idx,
                 loss_g=g_loss_info['loss_g'],
-                loss_conf=g_loss_info['loss_conf'],
+                loss_conf=g_loss_info['loss_align'],
                 loss_div=g_loss_info['loss_div'],
                 loss_adv=g_loss_info['loss_adv'],
                 loss_balance=g_loss_info['loss_balance'],

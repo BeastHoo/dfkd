@@ -92,10 +92,14 @@ gamma: 0.5
 #   - 对应 FedIOD w_baln=10，但我们已对齐为正值熵后取负，量级不同
 #   - compute_loss_balance 返回正值（log2 熵，范围 0~3.32），总损失中取负
 #   - 建议从 1.0 开始，若 fake data 仍退化为单类则增大至 2.0~5.0
+# lambda_adv：G 更新时 S 对 ensemble_T 对齐的损失权重
+#   - 对应 FedIOD w_adv=1.0
+#   - 使 G 生成"让 S 预测接近 T 聚合结果"的图像
 lambda1: 1.0
 lambda2: 0.5
 lambda3: 1.0
 lambda_balance: 1.0
+lambda_adv: 1.0
 
 # ---------- 优化器学习率 ----------
 # lr_g=0.0002：DCGAN 原论文标准值，GAN 训练中最稳定的 G 学习率
